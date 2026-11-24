@@ -1,0 +1,9 @@
+{
+  "repositoryId": 1469469532,
+  "mode": "synthetic-sandbox-only",
+  "files": {
+    "data/manifest.json": "2b0f1d764a3d02ecfc7dbb6974747b8ec0d6771ff157d71917714ec09daa6866",
+    "data/payload.json": "3a37782e8974c48eebf2a0517c866ad15641c53b3d31993188796b56aeb79624"
+  },
+  "previousBase": "2ef8ba687523bb2b4e97692afc6b8c803ed1905b"
+}
