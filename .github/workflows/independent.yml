@@ -1,0 +1,33 @@
+name: Independent sandbox release check
+on:
+  workflow_dispatch:
+    inputs:
+      pull_request:
+        description: Sandbox pull request number
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  validate:
+    if: github.repository_id == '1469469532' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment:
+      name: isolated-check-main
+      deployment: false
+    steps:
+      - name: Fetch exact trusted main
+        run: |
+          git init -q .
+          git remote add origin https://github.com/17Fox-CSC/pesticide-release-check-sandbox.git
+          git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main
+          test "$(git rev-parse origin/main)" = "$GITHUB_SHA"
+          git checkout --detach "$GITHUB_SHA"
+      - name: Verify test merge and report through the App
+        env:
+          INPUT_PR: ${{ inputs.pull_request }}
+          RELEASE_APP_ID: ${{ vars.RELEASE_APP_ID }}
+          RELEASE_INSTALLATION_ID: ${{ vars.RELEASE_INSTALLATION_ID }}
+          RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+        run: node control/check.mjs
