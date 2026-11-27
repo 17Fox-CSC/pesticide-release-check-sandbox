@@ -8,16 +8,24 @@ The sandbox fixture is pre-registered at bootstrap. All later changes to trusted
 
 ## Synthetic public mirror model
 
-The verifier consumes GitHub's repository ID, PR number, current base, head,
-and two-parent test merge. The release must descend from the pre-approval
-base, and both the candidate diff and its effect on the merge may touch
-only `data/`. Trusted control records are read as Git blobs from the
-protected base. The candidate's workflow, checker and control files are never
-executed or used as authority.
+The verifier consumes GitHub's repository ID, PR number, current base, head
+and two-parent test merge. It classifies the PR using both the candidate
+diff and the merge effect. Mixed or ambiguous changes fail closed.
 
-For a post-bootstrap synthetic test, first prepare a data-only candidate and
-obtain its PR number and head SHA. On main, an independently reviewed
-control-only registration commit would then contain:
+- **Approval registration** proposes only the three fixed paths below.
+  The trusted signer reads them as ordinary Git blobs and independently
+  fetches the distinct target release PR. It must be open in this repository,
+  target the same main base, fork from that pre-approval base, and change only
+  data. The signer verifies the target candidate against the proposed approvals
+  and re-reads both PRs before signing. The registration status applies only to
+  the registration test merge, and independent GitHub review still applies.
+- **Release** changes only `data/`. It consumes the registry and approval
+  already present on protected main and independently re-verifies the live
+  PR and exact tested bytes. It never consumes approvals from its candidate
+  tree or branch. Candidate code is never executed in either mode.
+
+Prepare a data-only candidate PR before submitting the independently reviewed
+control-only registration PR with:
 
 - `control/release-registry.json`: schema, pre-approval base SHA, and SHA-256
   of the exact approval record bytes.
@@ -31,8 +39,9 @@ control-only registration commit would then contain:
 The registration binds the existing candidate head and its staged bytes.
 The checker derives the registration commit and the test merge from GitHub,
 so the approval record does not need to name its own commit or an unborn merge.
-Only one immediate control-only registration commit is accepted. A new
-candidate push or base commit makes the old recording inapplicable.
+Only one immediate control-only registration commit is accepted, including
+GitHub's two-parent merge format. A new candidate push or unrelated base
+commit makes that registration inapplicable.
 The existing bootstrap records remain historical and cannot authorize this
 model. The synthetic dates and IDs are fixed deliberately.
 
@@ -62,7 +71,8 @@ data-only candidate and cannot sign its own code upgrade PR. Do not dispatch
 candidate code with the App key or satisfy the review requirement with an
 untrusted status.
 
-For a synthetic PR with a trusted registration, record the GitHub API base,
+First sign the registration PR, complete independent review, and merge it
+through the existing sandbox rule. Then sign the separate release PR. Record the GitHub API base,
 head, test merge, App status, and applicable Rule Suite. Verify the App
 status is restricted to that test merge. Push the candidate, advance main,
 change or omit the approved record in a controlled fixture, and withhold

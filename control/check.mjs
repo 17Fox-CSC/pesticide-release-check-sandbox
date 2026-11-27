@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createSign } from 'node:crypto';
-import { repositoryId, verify } from './mirror-model.mjs';
+import { registrationTarget, repositoryId, verify, verifyRegistration } from './mirror-model.mjs';
 import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 
@@ -49,36 +49,52 @@ async function run() {
   assert.deepEqual(auth.permissions,{contents:'read',pull_requests:'read',statuses:'write',metadata:'read'});
   const token = auth.token;
   const repoApi = '/repos/'+repository;
-  async function state() {
+  async function state(prNumber) {
     const [main, pr] = await Promise.all([
       api(repoApi+'/branches/main',token),
-      api(repoApi+'/pulls/'+env.INPUT_PR,token),
+      api(repoApi+'/pulls/'+prNumber,token),
     ]);
-    assert.equal(pr.number, Number(env.INPUT_PR));
+    assert.equal(pr.number, prNumber);
     assert.equal(pr.state,'open');
     assert.equal(pr.base.repo.id, repositoryId);
     assert.equal(pr.base.ref,'main');
     assert.equal(pr.base.sha, main.commit.sha);
-    const refs = {base:pr.base.sha,head:pr.head.sha,merge:pr.merge_commit_sha};
-    for (const ref of Object.values(refs)) assert.match(ref,fullSha);
+    const { sha:base } = pr.base;
+    const { sha:head } = pr.head;
+    const merge = pr.merge_commit_sha;
+    for (const ref of [base,head,merge]) assert.match(ref,fullSha);
+    const refs = {repository:repositoryId, pr:pr.number, base, head, merge, open:true};
     return refs;
   }
+  function fetchMerge(refs) {
+    git('fetch','--no-tags','origin','refs/pull/'+refs.pr+'/merge');
+    assert.equal(git('rev-parse','FETCH_HEAD').trim(),refs.merge, 'GitHub merge ref differs from API');
+  }
   try {
-    const checked = await state();
+    const checked = await state(Number(env.INPUT_PR));
     assert.equal(checked.base, env.GITHUB_SHA, 'Workflow main advanced');
-    git('fetch','--no-tags','origin','refs/pull/'+env.INPUT_PR+'/merge');
-    assert.equal(git('rev-parse','FETCH_HEAD').trim(),checked.merge, 'GitHub merge ref differs from API');
-    let reason, evidence;
-    try { evidence = verify({ ...checked, repository: repositoryId, pr: Number(env.INPUT_PR) }); } catch (error) { reason = error.name + ': ' + String(error.message).split('\n')[0]; }
-    assert.deepEqual(await state(), checked, 'PR changed while checking');
+    fetchMerge(checked);
+    let reason, evidence, target;
+    try {
+      const number = registrationTarget(checked);
+      if (number === null) {
+        evidence = verify(checked);
+      } else {
+        target = await state(number);
+        fetchMerge(target);
+        evidence = verifyRegistration(checked, target);
+        assert.deepEqual(await state(target.pr), target, 'Target release PR changed while checking');
+      }
+    } catch (error) { reason = error.name + ': ' + String(error.message).split('\n')[0]; }
+    assert.deepEqual(await state(checked.pr), checked, 'PR changed while checking');
     const result = await api(repoApi+'/statuses/'+checked.merge, token, {
       context, state:reason?'failure':'success',
-      description:reason?'Synthetic candidate rejected':'Exact synthetic approval verified',
+      description:reason?'Synthetic candidate rejected':target?'Synthetic registration verified':'Exact synthetic release verified',
       target_url:'https://github.com/'+repository+'/actions/runs/'+env.GITHUB_RUN_ID,
     });
     assert.equal(result.state,reason?'failure':'success');
     assert.equal(result.context,context);
-    console.log(JSON.stringify({ ...checked, state:result.state, context:result.context, actor:result.creator.login, appId:env.RELEASE_APP_ID, evidence, reason }));
+    console.log(JSON.stringify({ ...checked, state:result.state, context:result.context, actor:result.creator.login, appId:env.RELEASE_APP_ID, evidence, target, reason }));
     if (reason) process.exitCode=1;
   } finally {
     await fetch('https://api.github.com/installation/token', {

@@ -28,10 +28,11 @@ const control = {
 const latestKeys = ['note', 'sourceId', 'source', 'url', 'date', 'dataDate', 'unit', 'rawUnit', 'index', 'quotes'];
 const quoteKeys = ['name', 'price', 'cat', 'spec'];
 
-export function verify({ repository, pr, base, head, merge, cwd = process.cwd() }) {
-  assert.equal(repository, repositoryId, 'Wrong repository');
-  assert(Number.isSafeInteger(pr) && pr > 0, 'Invalid PR number');
-  for (const ref of [base, head, merge]) assert.match(ref, fullSha);
+const controlPaths = Object.values(control);
+const keys = (obj, expected, what) =>
+  assert.deepEqual(Object.keys(obj).sort(), expected.toSorted(), 'Unexpected ' + what + ' fields');
+
+function gitContext(cwd) {
   const git = (...args) => execFileSync('git', args, { cwd, maxBuffer: 8 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
   const text = (...args) => git(...args).toString().trim();
   const changed = (a, b) => git('diff', '--no-renames', '--name-only', '-z', a, b).toString().split('\0').filter(Boolean).sort();
@@ -39,40 +40,102 @@ export function verify({ repository, pr, base, head, merge, cwd = process.cwd() 
     assert.equal(text('ls-tree', ref, '--', path).split(' ')[0], '100644', 'Missing or non-regular file: ' + path);
     return git('show', ref + ':' + path);
   };
-  const json = (ref, path) => JSON.parse(read(ref, path));
-  assert.equal(text('rev-parse', 'HEAD'), base, 'The checker must run from the exact protected base');
-  assert.deepEqual(text('show', '-s', '--format=%P', merge).split(' '), [base, head], 'Unexpected merge parents');
-  const ancestor = text('merge-base', '--all', base, head);
-  assert.match(ancestor, fullSha, 'Ambiguous merge base');
-  for (const diff of [changed(ancestor, head), changed(base, merge)]) {
-    assert(diff.length && diff.every(path => path.startsWith('data/')), 'A release may only modify data/');
-  }
+  return { git, text, changed, read, json: (ref, path) => JSON.parse(read(ref, path)) };
+}
 
-  const registry = json(base, control.registry);
+function candidate(refs, g = gitContext(refs.cwd)) {
+  const { repository, pr, base, head, merge } = refs;
+  assert.equal(repository, repositoryId, 'Wrong repository');
+  assert(Number.isSafeInteger(pr) && pr > 0, 'Invalid PR number');
+  for (const ref of [base, head, merge]) assert.match(ref, fullSha);
+  assert.equal(g.text('rev-parse', 'HEAD'), base, 'The checker must run from the exact protected base');
+  assert.deepEqual(g.text('show', '-s', '--format=%P', merge).split(' '), [base, head], 'Unexpected merge parents');
+  const ancestor = g.text('merge-base', '--all', base, head);
+  assert.match(ancestor, fullSha, 'Ambiguous merge base');
+  const diffs = [g.changed(ancestor, head), g.changed(base, merge)];
+  let mode;
+  if (diffs.every(paths => paths.length && paths.every(path => path.startsWith('data/')))) mode = 'release';
+  else if (diffs.every(paths => paths.includes(control.registry) && paths.every(path => controlPaths.includes(path)))) mode = 'approval-registration';
+  else assert.fail('A release may only modify data/; a registration may only modify its fixed control paths');
+  return { ...g, ancestor, mode };
+}
+
+function records(g, ref) {
+  const registry = g.json(ref, control.registry);
+  keys(registry, ['schema', 'previousBase', 'approvalSha256'], 'registry');
   assert.equal(registry.schema, 1);
   assert.match(registry.previousBase, fullSha);
-  assert.equal(text('show', '-s', '--format=%P', base), registry.previousBase, 'Approval base advanced');
-  assert.equal(ancestor, registry.previousBase, 'Candidate does not fork from the pre-approval base');
-  const registration = changed(registry.previousBase, base);
-  assert(registration.length && registration.every(path => Object.values(control).includes(path)) &&
-    registration.includes(control.registry), 'Trusted registration commit may only change release control records');
-  const approvalBytes = read(base, control.approval);
   assert.match(registry.approvalSha256, digest);
+  const approvalBytes = g.read(ref, control.approval);
   assert.equal(sha(approvalBytes), registry.approvalSha256, 'Approval record digest mismatch');
   const approval = JSON.parse(approvalBytes);
+  keys(approval, ['schema','mode','repository','pr','head','action','active','stage','orderedVersions','rollbackTarget','p0EvidenceSha256'], 'approval');
+  keys(approval.active, ['version','indexSha256','manifestSha256'], 'active approval');
+  keys(approval.stage, ['versions','indexSha256','manifestSha256'], 'staged approval');
   assert.equal(approval.schema, 1);
   assert.equal(approval.mode, 'synthetic-sandbox-only');
-  assert.equal(approval.repository, repository);
-  assert.equal(approval.pr, pr);
-  assert.equal(approval.head, head, 'Candidate head differs from trusted approval');
-
-  const p0Bytes = read(base, control.p0);
+  assert.equal(approval.repository, repositoryId);
+  assert(Number.isSafeInteger(approval.pr) && approval.pr > 0, 'Invalid approved PR number');
+  assert.match(approval.head, fullSha);
+  assert(['align','advance'].includes(approval.action), 'Unsupported release action');
+  const p0Bytes = g.read(ref, control.p0);
   assert.match(approval.p0EvidenceSha256, digest);
   assert.equal(sha(p0Bytes), approval.p0EvidenceSha256, 'P0 evidence digest mismatch');
   assert.deepEqual(JSON.parse(p0Bytes), {
-    schema: 1, scope: 'synthetic-sandbox-only', repository, pr, action: approval.action,
+    schema: 1, scope: 'synthetic-sandbox-only', repository: approval.repository, pr: approval.pr, action: approval.action,
     decision: 'simulate-only',
   }, 'Invalid synthetic P0 evidence');
+  return { registry, approval };
+}
+
+export function registrationTarget(refs) {
+  const g = candidate(refs);
+  if (g.mode === 'release') return null;
+  assert.equal(g.ancestor, refs.base, 'Registration must fork from the current protected base');
+  for (const path of controlPaths) {
+    assert(g.read(refs.head, path).equals(g.read(refs.merge, path)), 'Registration merge changed control bytes: ' + path);
+  }
+  const { registry, approval } = records(g, refs.merge);
+  assert.equal(registry.previousBase, refs.base, 'Registration binds a different base');
+  assert(approval.pr !== refs.pr && approval.head !== refs.head, 'Registration cannot approve itself');
+  return approval.pr;
+}
+
+export function verifyRegistration(refs, target) {
+  assert(target?.open === true, 'Target release PR is missing or closed');
+  const pr = registrationTarget(refs);
+  assert(pr && target.pr === pr, 'Wrong target release PR');
+  assert.equal(target.base, refs.base, 'Target release PR has a different base');
+  const g = candidate(target, gitContext(refs.cwd));
+  assert.equal(g.mode, 'release', 'Target release PR may only modify data/');
+  assert.equal(g.ancestor, refs.base, 'Target release head must fork from the registration base');
+  return verifyPayload(target, g, records(g, refs.merge));
+}
+
+export function verify(refs) {
+  const g = candidate(refs);
+  assert.equal(g.mode, 'release', 'Registration requires an independently read target release PR');
+  const { base } = refs;
+  const r = records(g, base);
+  const { previousBase } = r.registry;
+  const parents = g.text('show', '-s', '--format=%P', base).split(' ');
+  assert(parents.length <= 2 && parents[0] === previousBase, 'Approval base advanced');
+  assert.equal(g.ancestor, previousBase, 'Candidate does not fork from the pre-approval base');
+  const checkRegistration = changes => changes.includes(control.registry) && changes.every(path => controlPaths.includes(path));
+  assert(checkRegistration(g.changed(previousBase, base)), 'Trusted registration commit may only change release control records');
+  if (parents.length === 2) {
+    // GitHub's configured merge-commit mode preserves the registration head.
+    assert.equal(g.text('merge-base', '--all', previousBase, parents[1]), previousBase, 'Registration head was based on a different commit');
+    assert(checkRegistration(g.changed(previousBase, parents[1])), 'Registration head may only change release control records');
+    for (const path of controlPaths) assert(g.read(base, path).equals(g.read(parents[1], path)), 'Registration merge changed control bytes: ' + path);
+  }
+  return verifyPayload(refs, g, r);
+}
+
+function verifyPayload({ repository, pr, base, head, merge }, { git, read, json }, { registry, approval }) {
+  assert.equal(approval.repository, repository);
+  assert.equal(approval.pr, pr);
+  assert.equal(approval.head, head, 'Candidate head differs from trusted approval');
 
   function pointers(ref, pins) {
     const get = name => {
@@ -134,7 +197,6 @@ export function verify({ repository, pr, base, head, merge, cwd = process.cwd() 
   }
 
   const [a,b] = issues;
-  assert(['align','advance'].includes(approval.action), 'Unsupported release action');
   const advance = approval.action === 'advance';
   const ordered = advance ? [a.version,b.version] : [a.version];
   assert.deepEqual(approval.orderedVersions, ordered, 'Approval has unsafe history');

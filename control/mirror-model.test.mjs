@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import { gzipSync } from 'node:zlib';
-import { repositoryId, verify } from './mirror-model.mjs';
+import { registrationTarget, repositoryId, verify, verifyRegistration } from './mirror-model.mjs';
 
 const sha = bytes => createHash('sha256').update(bytes).digest('hex');
 const encoded = obj => Buffer.from(JSON.stringify(obj) + '\n');
@@ -56,7 +56,7 @@ function snapshot(inputs) {
 const pins = stage => ({
   indexSha256: sha(stage.tree['data/index.json']), manifestSha256: sha(stage.tree['data/manifest.json']),
 });
-function fixture(t, { action = 'align', makeStage, mutateHead, mutatePins, mutateP0, mutateApproval, mutateRegistry, omit = [] } = {}) {
+function fixture(t, { action = 'align', makeStage, mutateHead, mutatePins, mutateP0, mutateP0Scope, mutateApproval, mutateRegistry, omit = [] } = {}) {
   const cwd = mkdtempSync(join(tmpdir(), 'sandbox-release-test-'));
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
   const git = (...args) => execFileSync('git', args, { cwd, stdio: ['ignore','pipe','pipe'], encoding: 'utf8',
@@ -79,7 +79,9 @@ function fixture(t, { action = 'align', makeStage, mutateHead, mutatePins, mutat
   const active = snapshot(advance ? [[A,payload([one])]] : [[legacy,payload([{ id: 100,date:'2026-09-30',dataDate:'2026-09-27' }])]]);
   writeData(active.tree);
   for (const f of ['control/check.mjs','.github/workflows/independent.yml']) put(f, 'original synthetic fixture\n');
-  const previousBase = commit('Controlled anchor');
+  const olderBase = commit('Earlier protected base');
+  git('commit', '--allow-empty', '-qm', 'Controlled anchor');
+  const previousBase = git('rev-parse','HEAD');
   git('switch','-qc','candidate');
   const stage = makeStage?.() ?? snapshot(advance ? [[A,payload([one])],[B,payload([one,two])]] : [[A,payload([one])]]);
   writeData(stage.tree);
@@ -87,6 +89,7 @@ function fixture(t, { action = 'align', makeStage, mutateHead, mutatePins, mutat
   const head = commit('Synthetic candidate');
   git('switch','-q','main');
   const p0 = { schema: 1, scope: 'synthetic-sandbox-only', repository: repositoryId, pr, action, decision: 'simulate-only' };
+  mutateP0Scope?.(p0);
   const approval = {
     schema: 1, mode: 'synthetic-sandbox-only', repository: repositoryId, pr, head, action,
     active: { version: active.current, ...pins(active) },
@@ -109,7 +112,7 @@ function fixture(t, { action = 'align', makeStage, mutateHead, mutatePins, mutat
     return git('commit-tree',tree,'-p',left,'-p',right,'-m','Synthetic test merge');
   }
   return { refs: { repository: repositoryId, pr, base, head, merge: mergeTree(base,head), cwd },
-    git, put, commit, mergeTree, registry, approval };
+    git, put, commit, mergeTree, registry, approval, olderBase };
 }
 function rejected(t, options, why) {
   const { refs } = fixture(t,options);
@@ -216,4 +219,134 @@ test('reject changed latest price bytes in the staged fallback A', t => {
   latest.quotes[0].price=500;
   tampered['price-latest.json']=encoded(latest);
   rejected(t,{action:'advance',makeStage:()=>snapshot([[A,tampered],[B,payload([one,two])]])},/Staged rollback A differs/);
+});
+
+const registrationPr = 71;
+function registrationFixture(t, options) {
+  const f = fixture(t, options);
+  const {refs, registry, git, mergeTree} = f;
+  const anchor = registry.previousBase;
+  const registration = {
+    ...refs, pr: registrationPr, base: anchor, head: refs.base, merge: mergeTree(anchor,refs.base),
+  };
+  const target = { ...refs, base: anchor, merge: mergeTree(anchor,refs.head), open: true };
+  git('switch','-q','--detach',anchor);
+  return { ...f, registration, target };
+}
+
+for (const action of ['align','advance']) {
+  test('register a distinct open ' + action + ' PR and release after a protected two-parent merge', t => {
+    const {git, mergeTree, registration, target, registry, approval} = registrationFixture(t,{action});
+    const expected = {approvalSha256:registry.approvalSha256,p0EvidenceSha256:approval.p0EvidenceSha256};
+    assert.equal(registrationTarget(registration),target.pr);
+    assert.equal(registrationTarget(target),null);
+    assert.deepEqual(verifyRegistration(registration,target),expected);
+    // The sandbox Ruleset uses merge commits, so the trusted registration
+    // needs to remain valid when main has both original GitHub parents.
+    git('switch','-q','--detach',registration.merge);
+    const release = { ...target, base:registration.merge, merge:mergeTree(registration.merge,target.head) };
+    assert.deepEqual(verify(release),expected);
+  });
+}
+
+function editRegistration(f, edit) {
+  const {git,put,commit,mergeTree,registration} = f;
+  git('switch','-q','--detach',registration.head);
+  edit({git,put,cwd:registration.cwd});
+  const head = commit('Alter registration candidate');
+  // Test the same GitHub trusted checkout semantics as the signer.
+  git('switch','-q','--detach',registration.base);
+  return {...registration,head,merge:mergeTree(registration.base,head)};
+}
+for (const path of ['README.md','control/check.mjs','control/mirror-model.mjs','.github/workflows/independent.yml',
+  'data/unapproved.json','control/arbitrary.json']) {
+  test('reject registration mixed with ' + path, t => {
+    const f = registrationFixture(t);
+    const refs = editRegistration(f,({put})=>put(path,'candidate code or data'));
+    assert.throws(()=>verifyRegistration(refs,f.target),/only modify its fixed control paths/);
+  });
+}
+test('reject deletion of a fixed control file', t => {
+  const f = registrationFixture(t);
+  const refs = editRegistration(f,({git})=>git('rm','control/release-p0.json'));
+  assert.throws(()=>verifyRegistration(refs,f.target),/Missing or non-regular file/);
+});
+test('reject renaming a fixed control file out of the allowlist', t => {
+  const f = registrationFixture(t);
+  const refs = editRegistration(f,({git})=>git('mv','control/release-p0.json','control/stolen.json'));
+  assert.throws(()=>verifyRegistration(refs,f.target),/only modify its fixed control paths/);
+});
+test('reject rename between fixed paths when it removes required bytes', t => {
+  const f = registrationFixture(t);
+  const refs = editRegistration(f,({git})=>git('mv','-f','control/release-p0.json','control/release-approval.json'));
+  assert.throws(()=>verifyRegistration(refs,f.target),/Missing or non-regular file/);
+});
+test('reject a symbolic link at a control path', t => {
+  const f = registrationFixture(t);
+  const refs = editRegistration(f,({cwd,git})=>{
+    git('rm','control/release-p0.json');
+    symlinkSync('release-approval.json',join(cwd,'control/release-p0.json'));
+  });
+  assert.throws(()=>verifyRegistration(refs,f.target),/Missing or non-regular file/);
+});
+test('reject a gitlink at a control path', t => {
+  const f = registrationFixture(t);
+  const {registration,git,mergeTree,target} = f;
+  git('switch','-q','--detach',registration.head);
+  git('rm','control/release-p0.json');
+  git('update-index','--add','--cacheinfo','160000,'+registration.base+',control/release-p0.json');
+  git('commit','-qm','Synthetic gitlink');
+  const head=git('rev-parse','HEAD');
+  git('switch','-q','--detach',registration.base);
+  const refs={...registration,head,merge:mergeTree(registration.base,head)};
+  assert.throws(()=>verifyRegistration(refs,target),/Missing or non-regular file/);
+});
+test('reject a registration approving itself', t => {
+  const {registration,target}=registrationFixture(t);
+  assert.throws(()=>verifyRegistration({...registration,pr:target.pr},target),/cannot approve itself/);
+});
+test('reject missing or closed target release PR', t => {
+  const {registration,target}=registrationFixture(t);
+  assert.throws(()=>verifyRegistration(registration),/missing or closed/);
+  assert.throws(()=>verifyRegistration(registration,{...target,open:false}),/missing or closed/);
+});
+test('reject a different target PR number', t => {
+  const {registration,target}=registrationFixture(t);
+  assert.throws(()=>verifyRegistration(registration,{...target,pr:target.pr+1}),/Wrong target release PR/);
+});
+test('reject a pushed target with the same data tree and a new head', t => {
+  const {registration,target,git,mergeTree}=registrationFixture(t);
+  const tree=git('rev-parse',target.head+'^{tree}');
+  const head=git('commit-tree',tree,'-p',target.head,'-m','New target commit');
+  assert.throws(()=>verifyRegistration(registration,{...target,head,merge:mergeTree(target.base,head)}),/Candidate head differs/);
+});
+test('reject target release head forked from an older base', t => {
+  const {registration,target,olderBase,git,mergeTree}=registrationFixture(t);
+  const tree=git('rev-parse',target.head+'^{tree}');
+  const head=git('commit-tree',tree,'-p',olderBase,'-m','Stale fork');
+  assert.throws(()=>verifyRegistration(registration,{...target,head,merge:mergeTree(target.base,head)}),/fork from the registration base/);
+});
+test('reject non-data target even when its merge is well-formed', t => {
+  const {registration,target}=registrationFixture(t,{mutateHead:put=>put('README.md','Unapproved')});
+  assert.throws(()=>verifyRegistration(registration,target),/only modify data/);
+});
+test('reject candidate approval and P0 digest drift in registration', t => {
+  const a=registrationFixture(t,{mutateApproval:x=>x.action='advance'});
+  assert.throws(()=>verifyRegistration(a.registration,a.target),/Approval record digest mismatch/);
+  const b=registrationFixture(t,{mutateP0:x=>x.decision='other'});
+  assert.throws(()=>verifyRegistration(b.registration,b.target),/P0 evidence digest mismatch/);
+});
+test('reject approval fields and P0 scope even when digests are internally consistent', t => {
+  const f=registrationFixture(t,{mutatePins:x=>x.extra='synthetic'});
+  assert.throws(()=>verifyRegistration(f.registration,f.target),/Unexpected approval fields/);
+  const scoped=registrationFixture(t,{mutateP0Scope:x=>x.decision='publish'});
+  assert.throws(()=>verifyRegistration(scoped.registration,scoped.target),/Invalid synthetic P0 evidence/);
+});
+test('reject bad staged index pins during registration', t => {
+  const {registration,target}=registrationFixture(t,{mutatePins:x=>x.stage.indexSha256='c'.repeat(64)});
+  assert.throws(()=>verifyRegistration(registration,target),/index digest mismatch/);
+});
+test('reject invalid control merge parent', t => {
+  const {registration,target}=registrationFixture(t);
+  assert.throws(()=>verifyRegistration({...registration,merge:registration.head},target),/Unexpected merge parents/);
 });
