@@ -1,33 +1,36 @@
-name: Independent sandbox release check
+name: One-time synthetic checker bootstrap producer
 on:
   workflow_dispatch:
     inputs:
       pull_request:
-        description: Sandbox pull request number
+        description: One-time synthetic bootstrap selector
         required: true
         type: string
-permissions:
-  contents: read
+permissions: {}
 jobs:
-  validate:
-    if: github.repository_id == '1469469532' && github.ref == 'refs/heads/main'
+  robot:
+    if: github.repository_id == '1469469532' && github.ref == 'refs/heads/fixture/12b10-bootstrap-driver' && inputs.pull_request == '12b10-bootstrap-once'
     runs-on: ubuntu-latest
-    timeout-minutes: 5
-    environment:
-      name: isolated-check-main
-      deployment: false
+    timeout-minutes: 4
+    permissions:
+      contents: write
+      pull-requests: write
     steps:
-      - name: Fetch exact trusted main
+      - name: Fetch and check the reviewed driver revision
+        shell: bash
         run: |
-          git init -q .
-          git remote add origin https://github.com/17Fox-CSC/pesticide-release-check-sandbox.git
-          git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main
-          test "$(git rev-parse origin/main)" = "$GITHUB_SHA"
-          git checkout --detach "$GITHUB_SHA"
-      - name: Verify test merge and report through the App
+          set -euo pipefail
+          git init -q driver
+          git -C driver remote add origin https://github.com/17Fox-CSC/pesticide-release-check-sandbox.git
+          git -C driver fetch --no-tags origin refs/heads/fixture/12b10-bootstrap-driver
+          test "$(git -C driver rev-parse FETCH_HEAD)" = "$GITHUB_SHA"
+          git -C driver checkout --detach "$GITHUB_SHA"
+      - name: Submit the exact synthetic candidate
+        shell: bash
         env:
-          INPUT_PR: ${{ inputs.pull_request }}
-          RELEASE_APP_ID: ${{ vars.RELEASE_APP_ID }}
-          RELEASE_INSTALLATION_ID: ${{ vars.RELEASE_INSTALLATION_ID }}
-          RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
-        run: node control/check.mjs
+          GH_TOKEN: ${{ github.token }}
+          RUN_SELECTOR: ${{ inputs.pull_request }}
+        run: |
+          set -euo pipefail
+          base64 --decode driver/fixture/12b10/bootstrap.patch.b64 > "$RUNNER_TEMP/bootstrap.patch"
+          bash driver/fixture/12b10/robot.sh --run "$RUNNER_TEMP/bootstrap.patch"
