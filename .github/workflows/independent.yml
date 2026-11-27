@@ -1,33 +1,32 @@
-name: Independent sandbox release check
+name: Synthetic robot identity probe
 on:
   workflow_dispatch:
     inputs:
       pull_request:
-        description: Sandbox pull request number
+        description: One-time synthetic probe selector
         required: true
         type: string
-permissions:
-  contents: read
+permissions: {}
 jobs:
-  validate:
-    if: github.repository_id == '1469469532' && github.ref == 'refs/heads/main'
+  robot:
+    if: github.repository_id == '1469469532' && github.ref == 'refs/heads/fixture/12b8-robot-driver' && inputs.pull_request == '12b8-robot-once'
     runs-on: ubuntu-latest
-    timeout-minutes: 5
-    environment:
-      name: isolated-check-main
-      deployment: false
+    timeout-minutes: 3
+    permissions:
+      contents: write
+      pull-requests: write
     steps:
-      - name: Fetch exact trusted main
-        run: |
-          git init -q .
-          git remote add origin https://github.com/17Fox-CSC/pesticide-release-check-sandbox.git
-          git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main
-          test "$(git rev-parse origin/main)" = "$GITHUB_SHA"
-          git checkout --detach "$GITHUB_SHA"
-      - name: Verify test merge and report through the App
+      - name: Create one synthetic PR with the job token
+        shell: bash
         env:
-          INPUT_PR: ${{ inputs.pull_request }}
-          RELEASE_APP_ID: ${{ vars.RELEASE_APP_ID }}
-          RELEASE_INSTALLATION_ID: ${{ vars.RELEASE_INSTALLATION_ID }}
-          RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
-        run: node control/check.mjs
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          repo=17Fox-CSC/pesticide-release-check-sandbox
+          branch=fixture/12b8-robot-candidate
+          base=c3f594ad1be767087b3487bb3e005c306d07a42d
+          test "$(gh api "repos/$repo/git/ref/heads/main" --jq .object.sha)" = "$base"
+          gh api --method POST "repos/$repo/git/refs" -f ref="refs/heads/$branch" -f sha="$base" --jq '{ref,sha:.object.sha}'
+          content=$(printf '%s\n' '{"scope":"synthetic-sandbox-only","test":"12b8-robot-identity","value":7}' | base64 -w0)
+          gh api --method PUT "repos/$repo/contents/data/robot-identity-probe.json" -f branch="$branch" -f content="$content" -f message='Add fixed synthetic robot identity fixture' --jq '{path:.content.path,sha:.commit.sha,author:.commit.author.name,committer:.commit.committer.name}'
+          gh api --method POST "repos/$repo/pulls" -f base=main -f head="$branch" -f title='12B-8 sandbox synthetic robot approval probe' -f body='Synthetic identity and independent review test. Keep open for audit. No publication.' --jq '{number,html_url,author:.user.login,author_type:.user.type,head:.head.sha,base:.base.sha}'
